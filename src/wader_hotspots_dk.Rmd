@@ -1,0 +1,353 @@
+---
+title: "Wader Hotspots Denmark"
+author: "Ismael Kreie Engelbreth Larsen"
+date: "2026-06-01"
+output: html_document
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+# Load required libraries
+library(tidyverse)  # data manipulation and ggplot2
+library(sf)         # spatial data handling
+library(MASS)       # kde2d for kernel density estimation
+
+# Set a consistent theme for plots
+theme_set(theme_minimal())
+```
+
+```{r read-gbif-csv}
+# Load the GBIF occurrence data
+# Source: GBIF Occurrence Download, doi:10.15468/dl.tt323j
+# Downloaded 01 June 2026, CC BY-NC 4.0
+# Key columns used in analysis:
+# species - character (scientific name)
+# decimalLatitude, decimalLongitude - numeric (WGS84 coordinates)
+# month, year - numeric (used for temporal filtering)
+
+df <- suppressWarnings(
+  read_tsv("../data/gbif_scolopacidae_dk.csv",
+           show_col_types = FALSE)
+)
+
+cat("Rows loaded:", nrow(df), "\n")
+cat("Columns:", ncol(df), "\n")
+```
+
+```{r clean-data}
+# Select relevant columns and apply cleaning filters
+df_clean <- df %>%
+  dplyr::select(
+    gbifID,
+    species,
+    decimalLatitude,
+    decimalLongitude,
+    month,
+    year
+  ) %>%
+  # Remove records with missing coordinates
+  filter(!is.na(decimalLatitude), !is.na(decimalLongitude)) %>%
+  # Restrict to Denmark's geographic bounding box
+  # Encompasses mainland Denmark and all major islands including Bornholm
+  filter(
+    decimalLatitude  >= 54.5, decimalLatitude  <= 57.8,
+    decimalLongitude >= 8.0,  decimalLongitude <= 15.3
+  ) %>%
+  # Restrict to study period
+  filter(year >= 2016, year <= 2025) %>%
+  # Filter to peak migration months only
+  # Spring passage: April-May, Autumn passage: July-September
+  # Scolopacidae are predominantly migratory in Denmark;
+  # restricting to these months focuses the analysis on passage birds
+  # (Meltofte et al., 2019)
+  filter(month %in% c(4, 5, 7, 8, 9))
+
+cat("Rows after cleaning:", nrow(df_clean), "\n")
+
+# Species frequency overview
+df_clean %>%
+  count(species, sort = TRUE) %>%
+  head(15) %>%
+  print()
+```
+
+```{r crs-transformation}
+# Convert cleaned data frame to spatial object (sf)
+# Input CRS: EPSG 4326 (WGS84 geographic coordinates, as provided by GBIF)
+df_sf <- df_clean %>%
+  st_as_sf(coords = c("decimalLongitude", "decimalLatitude"), crs = 4326)
+
+# Reproject to EPSG 25832 (UTM zone 32N)
+# Standard projected CRS for Denmark; uses metres for accurate distance calculations
+df_sf <- st_transform(df_sf, crs = 25832)
+
+cat("Spatial object created with", nrow(df_sf), "points\n")
+```
+
+```{r raw-observation-map}
+# Raw observation dot map, 10% random sample for rendering speed
+# The full dataset of 735,555 points is downsampled to 10% for rendering;
+# the spatial distribution is preserved.
+set.seed(42)  # ensures reproducibility of the random sample
+df_sample <- df_sf %>% slice_sample(prop = 0.1)
+
+ggplot() +
+  geom_sf(data = df_sample, alpha = 0.1, size = 0.3, colour = "steelblue") +
+  labs(
+    title = "Scolopacidae observations in Denmark (2016-2025)",
+    subtitle = "10% random sample - peak migration months (Apr-May, Jul-Sep)",
+    caption = "Source: GBIF / DOFbasen, BirdLife Denmark (doi:10.15468/dl.tt323j)"
+  ) +
+  theme_minimal()
+
+ggsave("../output/raw_observations.png",
+       width = 8, height = 7, dpi = 300, bg = "white")
+```
+
+```{r kde-compute}
+# Kernel Density Estimation (KDE) of wader observation density
+# Method: kde2d from the MASS package (Venables & Ripley, 2002)
+# following Silverman (1986)
+
+# Sample 200,000 points from 735,555 for computational efficiency
+# This represents 27% of the cleaned dataset
+set.seed(42)  # ensures reproducibility of the random sample
+coords <- st_coordinates(df_sf)
+coords <- coords[sample(nrow(coords), 200000), ]
+
+# Compute KDE on a 300x300 grid across the full data extent
+kde <- kde2d(
+  x = coords[, 1],
+  y = coords[, 2],
+  n = 300,
+  lims = c(range(coords[, 1]), range(coords[, 2]))
+)
+
+# Convert KDE output to a data frame and rescale density values to 0-1
+# Cap at 99th percentile to prevent a single intensively monitored site
+# from dominating the colour scale
+kde_df <- expand.grid(x = kde$x, y = kde$y) %>%
+  mutate(
+    density = as.vector(kde$z),
+    density_scaled = (density - min(density)) /
+                     (max(density) - min(density)),
+    density_capped = pmin(density_scaled, quantile(density_scaled, 0.99)),
+    density_capped = (density_capped - min(density_capped)) /
+                     (max(density_capped) - min(density_capped))
+  )
+
+cat("KDE calculated and rescaled -", nrow(kde_df), "grid cells\n")
+```
+
+```{r kde-map}
+# Load high-resolution Denmark boundary from DAWA (Danmarks Adressers Web API)
+# Official Danish geodata source
+denmark_outline <- st_read(
+  "https://api.dataforsyningen.dk/landsdele?format=geojson",
+  quiet = TRUE
+) %>%
+  st_union() %>%           # merge all regions into single national outline
+  st_transform(crs = 25832)
+
+# Filter to top 40% of density values for display
+# Low-density cells are excluded so the map shows distinct hotspots
+# rather than a uniform wash across the whole country
+kde_plot <- kde_df %>%
+  filter(density_capped > quantile(density_capped, 0.6))
+
+# Calculate min and max of filtered data
+# so legend labels match the actual plotted range
+kde_min <- min(kde_plot$density_capped)
+kde_max <- max(kde_plot$density_capped)
+
+ggplot() +
+  # White land background which distinguishes land from sea colour
+  geom_sf(data = denmark_outline, fill = "white", colour = NA) +
+  # KDE density surface
+  geom_tile(data = kde_plot,
+            aes(x = x, y = y, fill = density_capped)) +
+  # Country border on top for geographic reference
+  geom_sf(data = denmark_outline, fill = NA,
+          colour = "grey20", linewidth = 0.5) +
+  # Sequential white-orange-red palette
+  scale_fill_gradientn(
+    colours = c("#fff7ec", "#fee8c8", "#fdd49e",
+                "#fdbb84", "#fc8d59", "#e34a33", "#b30000"),
+    name = "Observation\ndensity",
+    limits = c(kde_min, kde_max),
+    breaks = c(kde_min, (kde_min + kde_max) / 2, kde_max),
+    labels = c("Low", "Medium", "High")
+  ) +
+  # Bounding box in UTM metres, shows all of Denmark without clipping
+  coord_sf(crs = 25832, expand = TRUE,
+           xlim = c(430000, 920000),
+           ylim = c(6030000, 6420000)) +
+  labs(
+    title = "Observation hotspots of migratory waders in Denmark",
+    subtitle = "Kernel Density Estimation of Scolopacidae records, peak migration 2016-2025",
+    caption = "Data: GBIF / DOFbasen, BirdLife Denmark (doi:10.15468/dl.tt323j). Boundary: DAWA/Dataforsyningen."
+  ) +
+  theme_void() +
+  theme(
+    plot.background = element_rect(fill = "white", colour = NA),
+    panel.background = element_rect(fill = "#eef4f8", colour = NA),
+    plot.title = element_text(size = 13, face = "bold",
+                              colour = "grey10", margin = margin(b = 4)),
+    plot.subtitle = element_text(size = 9, colour = "grey40",
+                                 margin = margin(b = 8)),
+    plot.caption = element_text(size = 7, colour = "grey50",
+                                margin = margin(t = 6)),
+    legend.position = c(0.92, 0.75),
+    legend.title = element_text(size = 8, colour = "grey20"),
+    legend.text = element_text(size = 7, colour = "grey30"),
+    plot.margin = margin(12, 20, 8, 12)
+  )
+
+ggsave("../output/kde_hotspots.png",
+       width = 8, height = 7, dpi = 300, bg = "white")
+```
+
+```{r load-miljøportal-data}
+# Load Danish EU Bird Protection Areas (EF-fuglebeskyttelsesområder)
+# Source: Danmarks Miljøportal / Arealdata API
+# https://arealdata.miljoeportal.dk/datasets/urn:dmp:ds:natura2000-fuglebeskyttelse
+# Designated under the EU Birds Directive (2009/147/EC)
+# Last updated: 1 June 2026
+
+# The file is included in the data/ folder of this repository.
+# The download logic below is retained for reproducibility -
+# if the file is deleted or the code is run in a new environment,
+# it will be re-downloaded automatically from Danmarks Miljøportal.
+if (!file.exists("../data/bird_protection_areas.gpkg")) {
+
+  temp_zip <- tempfile(fileext = ".zip")
+  download.file(
+    "https://arealdata-api.miljoeportal.dk/download/daie/FUGLE_BES_OMR_SHAPE.zip",
+    destfile = temp_zip,
+    mode = "wb"
+  )
+
+  temp_dir <- file.path(tempdir(), "zipfolder")
+  unzip(temp_zip, exdir = temp_dir)
+
+  shp_path <- list.files(temp_dir, pattern = "\\.shp$",
+                         recursive = TRUE, full.names = TRUE)[1]
+
+  bird_protection <- st_read(shp_path, quiet = TRUE) %>%
+    st_transform(crs = 25832)
+
+  st_write(bird_protection, "../data/bird_protection_areas.gpkg",
+           delete_dsn = TRUE, quiet = TRUE)
+
+  cat("Downloaded and saved to data folder\n")
+
+} else {
+
+  bird_protection <- st_read("../data/bird_protection_areas.gpkg", quiet = TRUE)
+  cat("Loaded from data folder\n")
+
+}
+
+cat("Bird protection areas loaded:", nrow(bird_protection), "\n")
+```
+
+```{r kde-hotspot-protection-join}
+# Spatial join: identify which top KDE hotspot cells fall within protection areas
+# The 500 highest-density KDE grid cells are used as point representatives
+# of the core hotspot areas
+
+top_hotspots <- kde_df %>%
+  arrange(desc(density_capped)) %>%
+  slice_head(n = 500) %>%
+  st_as_sf(coords = c("x", "y"), crs = 25832)
+
+# Point-within-polygon join using st_within (sf package)
+# Each hotspot cell is matched to the protection area it falls inside, if any
+hotspot_join <- st_join(top_hotspots, bird_protection, join = st_within)
+
+# Summarise results
+n_protected <- sum(!is.na(hotspot_join$Objektnavn))
+n_total     <- nrow(hotspot_join)
+
+cat("Top KDE hotspot cells within protection areas:",
+    n_protected, "out of", n_total, "\n")
+cat("Percentage:", round(n_protected / n_total * 100), "%\n")
+
+# Which protection areas contain the most hotspot cells?
+hotspot_join %>%
+  st_drop_geometry() %>%
+  filter(!is.na(Objektnavn)) %>%
+  count(Objektnavn, sort = TRUE) %>%
+  print()
+```
+
+```{r kde-overlay-map}
+# Overlay map: KDE hotspot surface with Natura 2000 protection areas
+# Transparent green fill shows protection areas without obscuring the density surface
+
+kde_plot <- kde_df %>%
+  filter(density_capped > quantile(density_capped, 0.6))
+
+kde_min <- min(kde_plot$density_capped)
+kde_max <- max(kde_plot$density_capped)
+
+ggplot() +
+  # White land background
+  geom_sf(data = denmark_outline, fill = "white", colour = NA) +
+  # KDE density surface
+  geom_tile(data = kde_plot,
+            aes(x = x, y = y, fill = density_capped)) +
+  # Natura 2000 Bird Protection Areas with transparent green overlay
+  geom_sf(data = bird_protection,
+          fill = "#52b788", colour = "#2d6a4f", alpha = 0.4, linewidth = 0.3) +
+  # Country border on top
+  geom_sf(data = denmark_outline, fill = NA,
+          colour = "grey20", linewidth = 0.5) +
+  scale_fill_gradientn(
+    colours = c("#fff7ec", "#fee8c8", "#fdd49e",
+                "#fdbb84", "#fc8d59", "#e34a33", "#b30000"),
+    name = "Observation\ndensity",
+    limits = c(kde_min, kde_max),
+    breaks = c(kde_min, (kde_min + kde_max) / 2, kde_max),
+    labels = c("Low", "Medium", "High")
+  ) +
+  coord_sf(crs = 25832, expand = TRUE,
+           xlim = c(430000, 920000),
+           ylim = c(6030000, 6420000)) +
+  # Manual legend key for protection areas
+  annotate("rect",
+           xmin = 730000, xmax = 750000,
+           ymin = 6045000, ymax = 6055000,
+           fill = "#52b788", colour = "#2d6a4f", alpha = 0.4, linewidth = 0.3) +
+  annotate("text", x = 755000, y = 6050000,
+           label = "Bird Protection Area (Natura 2000)",
+           size = 2.5, hjust = 0, colour = "grey20") +
+  labs(
+    title = "Wader observation hotspots and EU Bird Protection Areas",
+    subtitle = "KDE of Scolopacidae peak migration records (2016-2025) with Natura 2000 SPAs overlaid (green)",
+    caption = "Data: GBIF / DOFbasen, BirdLife Denmark (doi:10.15468/dl.tt323j). Protected areas: Danmarks Miljøportal. Boundary: DAWA."
+  ) +
+  theme_void() +
+  theme(
+    plot.background = element_rect(fill = "white", colour = NA),
+    panel.background = element_rect(fill = "#eef4f8", colour = NA),
+    plot.title = element_text(size = 13, face = "bold",
+                              colour = "grey10", margin = margin(b = 4)),
+    plot.subtitle = element_text(size = 9, colour = "grey40",
+                                 margin = margin(b = 8)),
+    plot.caption = element_text(size = 7, colour = "grey50",
+                                margin = margin(t = 6)),
+    legend.position = c(0.92, 0.75),
+    legend.title = element_text(size = 8, colour = "grey20"),
+    legend.text = element_text(size = 7, colour = "grey30"),
+    plot.margin = margin(12, 20, 8, 12)
+  )
+
+ggsave("../output/kde_with_protection.png",
+       width = 8, height = 7, dpi = 300, bg = "white")
+```
+
+```{r session-info}
+sink("../session_info.txt")
+sessionInfo()
+sink()
+```
