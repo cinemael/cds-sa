@@ -26,7 +26,7 @@ wader_hotspots_dk/
 │   ├── kde_hotspots.png                # Figure 2: KDE hotspot surface
 │   └── kde_with_protection.png         # Figure 3: KDE overlaid with protection areas
 ├── src/
-│   └── wader_hotspots_dk.Rmd           # Main analysis notebook
+│   └── wader_hotspots_dk.Rmd           # Main analysis script
 ├── README.md
 └── session_info.txt                    # R session info for reproducibility
 ```
