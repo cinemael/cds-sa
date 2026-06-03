@@ -17,7 +17,6 @@ This project applies Kernel Density Estimation (KDE) to citizen science occurren
 ## Repository structure
 
 ```
-wader_hotspots_dk/
 ├── data/
 │   ├── gbif_scolopacidae_dk.csv        # GBIF occurrence download (see Data sources)
 │   └── bird_protection_areas.gpkg      # EU Bird Protection Areas (auto-downloaded if missing)
